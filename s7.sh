@@ -1,7 +1,8 @@
 #!/bin/sh
 # s7.sh - 2026-10-31 기술팀장(프로필 tech) 만들기 (VPS 호스트, root). 컨테이너 재시작 없음 — 카드가 돌고 있어도 된다.
 # 0) 확인·받기(지문 고정)  1) 프로필 생성(설명 포함)
-# 2) AI팀장 프로필에서 모델 설정·플러그인 복사 + claude 경로·로그인 폴더 두 줄(오늘 AI팀장이 막혔던 원인)
+# 2) AI팀장 프로필에서 설정·플러그인 복사 + claude 경로·로그인 폴더 두 줄(오늘 AI팀장이 막혔던 원인)
+#    모델은 Opus(비서실장과 같은 값), 추론 강도 high — 점검·고장 원인 찾기는 판단하는 일이라서
 # 3) 기본 SOUL(하지 않는 것·회사 공통 수칙)  4) 한 문장 답으로 확인  + /root/hrestart.sh(재시작 도우미) 설치
 C=hermes-agent-bjmy-hermes-agent-1
 B=https://github.com/aigents-ai/card-templates/raw/s1
@@ -21,7 +22,7 @@ echo "== 1 프로필 만들기"
 $H timeout 120 hermes profile create tech --no-alias --description "$DESC" </dev/null 2>&1 | tail -3
 $H test -d /opt/data/profiles/tech || { echo "STOP: 프로필이 안 만들어졌어요"; exit 1; }
 
-echo "== 2 모델 설정·플러그인·claude 두 줄"
+echo "== 2 설정·플러그인·claude 두 줄·모델(Opus)"
 $H sh -c '
 S=/opt/data/profiles/insta-ai; D=/opt/data/profiles/tech
 [ -f $D/config.yaml ] && cp $D/config.yaml $D/config.yaml.orig
@@ -30,7 +31,10 @@ mkdir -p $D/plugins && cp -a $S/plugins/. $D/plugins/ || { echo "STOP: 플러그
 touch $D/.env; [ -n "$(tail -c1 $D/.env)" ] && echo >> $D/.env
 grep "^CLAUDE_SUBSCRIPTION_DIRECTSDK_" $S/.env | while IFS= read -r l; do k=${l%%=*}; grep -q "^$k=" $D/.env || echo "$l" >> $D/.env; done
 chmod 600 $D/.env
-echo "모델:$(grep -m1 -E "^[[:space:]]*default:" $D/config.yaml | cut -d: -f2-)"
+hermes -p tech config set model.default "claude-opus-5-5[1m]" >/dev/null || { echo "STOP: 모델 설정 실패"; exit 1; }
+hermes -p tech config set agent.reasoning_effort high >/dev/null || echo "추론 강도 설정은 건너뜀"
+echo "모델 설정:"; awk "/^model:/{f=1;print;next} f&&/^[^[:space:]#]/{f=0} f" $D/config.yaml
+grep -E "^[[:space:]]*reasoning_effort:" $D/config.yaml
 echo "플러그인: $(ls $D/plugins | tr "\n" " ")"
 grep "^CLAUDE_SUBSCRIPTION_DIRECTSDK_" $D/.env
 ' || exit 1
