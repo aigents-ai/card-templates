@@ -16,6 +16,7 @@ R0 통과 기준(계획서 8장): 정해진 종목의 분석·결정 기록이 3
 결과: /opt/data/work/trading-lab/records/<날짜>/<종목>.json · records.jsonl
       /opt/data/work/trading-lab/reports/<날짜>/<종목>/complete_report.html (+ .pdf)
       TradingAgents 기억: /opt/data/work/trading-lab/memory/trading_memory.md
+      시험(--tag test)은 같은 구조로 /opt/data/work/trading-lab/tests/ 아래에 따로 남는다
 비용: OpenRouter 키 사용액을 실행 전후로 읽어 그 차이를 적는다(키 한도가 돈의 상한).
 종료 코드: 0 전부 성공 · 1 실패한 종목 있음 · 2 설정·점검 실패 · 3 이미 실행 중
 """
@@ -160,13 +161,20 @@ def make_stats():
     return Stats()
 
 
+# ───────── 결과 위치: R0 기록과 시험 기록은 섞지 않는다 ─────────
+def out_base(kind: str) -> Path:
+    """r0 → work/trading-lab/ · test → work/trading-lab/tests/ (기록·보고서·기억을 따로 둔다:
+    시험이 30일 기록에 끼거나, 시험 결정이 R0 기억(교훈)에 들어가지 않게)."""
+    return WORK if kind == "r0" else WORK / "tests"
+
+
 # ───────── TradingAgents 설정 ─────────
-def set_env_paths():
+def set_env_paths(kind: str):
     """TradingAgents 는 가져올 때 기본 설정을 만든다 — 경로·업데이트 확인은 그 전에 정한다."""
     os.environ.setdefault("TRADINGAGENTS_NO_UPDATE_CHECK", "1")
     os.environ["TRADINGAGENTS_RESULTS_DIR"] = str(LAB / "results")
     os.environ["TRADINGAGENTS_CACHE_DIR"] = str(LAB / "cache")
-    os.environ["TRADINGAGENTS_MEMORY_LOG_PATH"] = str(WORK / "memory" / "trading_memory.md")
+    os.environ["TRADINGAGENTS_MEMORY_LOG_PATH"] = str(out_base(kind) / "memory" / "trading_memory.md")
 
 
 def ta_config(cfg: dict) -> dict:
@@ -188,23 +196,25 @@ def ta_config(cfg: dict) -> dict:
 
 def default_trade_date() -> str:
     """방금 끝난 UTC 하루. 코인 하루 봉은 UTC 0시(한국 9시)에 마감되고,
-    TradingAgents 는 날짜 d 의 실행을 'd 마감 뒤'로 보고 d 다음 첫 마감에 들어간 것으로 채점한다."""
+    TradingAgents 는 날짜 d 의 실행을 'd 마감 뒤'로 보고 d 다음 첫 마감에 들어간 것으로 채점한다.
+    이 날짜는 '오늘'보다 앞이라 TradingAgents 가 과거 시점 규칙으로 돈다(그 시점 뒤 자료·날짜 없는 뉴스·
+    지금의 예측시장 확률을 빼고 본다). R1 백테스트와 같은 규칙이라 기록끼리 비교할 수 있다 — 일부러 이렇게 둔다."""
     return (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat()
 
 
 # ───────── 기록 ─────────
-def record_path(trade_date: str, ticker: str) -> Path:
-    return WORK / "records" / trade_date / f"{ticker}.json"
+def record_path(trade_date: str, ticker: str, kind: str) -> Path:
+    return out_base(kind) / "records" / trade_date / f"{ticker}.json"
 
 
 def write_record(rec: dict, final: bool):
-    p = record_path(rec["trade_date"], rec["ticker"])
+    p = record_path(rec["trade_date"], rec["ticker"], rec["kind"])
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(tmp, p)
     if final:
-        with open(WORK / "records.jsonl", "a", encoding="utf-8") as f:
+        with open(out_base(rec["kind"]) / "records.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
 
@@ -238,9 +248,12 @@ def run_one(cfg: dict, key: str, ticker: str, trade_date: str, kind: str, prices
     stats = make_stats()
     try:
         ta = TradingAgentsGraph(selected_analysts=list(cfg["analysts"]), config=ta_config(cfg), callbacks=[stats])
+        # 생성자에 준 콜백은 AI 호출만 센다. 자료 호출(도구)은 그래프 실행 설정으로 넘겨야 잡힌다(CLI 와 같은 방법).
+        graph_args = ta.propagator.get_graph_args
+        ta.propagator.get_graph_args = lambda callbacks=None: graph_args(callbacks=[stats])
         rec["settings"] = ta.run_settings()
         final_state, rating = ta.propagate(ticker, trade_date, asset_type=cfg["asset_type"])
-        out_dir = WORK / "reports" / trade_date / ticker
+        out_dir = out_base(kind) / "reports" / trade_date / ticker
         ta.save_reports(final_state, ticker, save_path=out_dir, html=True)
         html = out_dir / "complete_report.html"
         rec["report"] = rel(html)
@@ -265,8 +278,10 @@ def run_one(cfg: dict, key: str, ticker: str, trade_date: str, kind: str, prices
                 usage1 = key_usage(key)
                 if usage1 is not None and (usage1 > usage0 or not rec.get("llm_calls")):
                     break
-            if usage1 is not None:
+            if usage1 is not None and (usage1 > usage0 or not rec.get("llm_calls")):
                 rec["cost_usd"] = round(usage1 - usage0, 4)
+            else:  # AI 를 불렀는데 사용액이 안 움직였으면 0 이 아니라 '모름'
+                log.warning("key usage did not move after %s LLM calls; cost unknown", rec.get("llm_calls"))
         write_record(rec, final=True)
     return rec
 
@@ -364,7 +379,7 @@ def main() -> int:
     ap.add_argument("--check", action="store_true", help="점검만(돈 안 씀)")
     ap.add_argument("--tickers", help="쉼표로 구분, 기본은 설정의 종목")
     ap.add_argument("--date", help="YYYY-MM-DD, 기본은 방금 끝난 UTC 하루")
-    ap.add_argument("--tag", default="r0", help="기록의 종류 (r0 · test)")
+    ap.add_argument("--tag", default="r0", choices=("r0", "test"), help="기록의 종류: r0(30일 기록) · test(시험, 따로 보관)")
     ap.add_argument("--force", action="store_true", help="성공 기록이 있어도 다시")
     a = ap.parse_args()
 
@@ -373,11 +388,12 @@ def main() -> int:
     except Exception as e:  # noqa: BLE001
         print(f"❌ 설정을 읽지 못했어요: {e}")
         return 2
-    set_env_paths()
+    set_env_paths(a.tag)
     if a.check:
         return check(cfg)
 
-    for d in (LAB / "logs", WORK / "records", WORK / "reports", WORK / "memory"):
+    base = out_base(a.tag)
+    for d in (LAB / "logs", base / "records", base / "reports", base / "memory"):
         d.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now(KST).strftime("%Y%m%d-%H%M%S")
     logging.basicConfig(filename=str(LAB / "logs" / f"{stamp}.log"), level=logging.INFO,
@@ -406,7 +422,7 @@ def main() -> int:
 
     failed = 0
     for t in tickers:
-        p = record_path(trade_date, t)
+        p = record_path(trade_date, t, a.tag)
         if p.exists() and not a.force:
             try:
                 if json.loads(p.read_text(encoding="utf-8")).get("status") == "ok":
