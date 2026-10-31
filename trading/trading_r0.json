@@ -1,0 +1,18 @@
+{
+  "v": 1,
+  "note": "트레이딩 연구소 R0 설정 — 봉인 대상. 분석·토론은 빠른 중간급, 최종 판단 두 번만 상위 모델(2026-11-01 대표 결정).",
+  "tickers": ["BTC-USD", "ETH-USD"],
+  "asset_type": "crypto",
+  "analysts": ["market", "news"],
+  "provider": "openrouter",
+  "quick_model": "openai/gpt-6.1-terra",
+  "deep_model": "openai/gpt-6.1-sol",
+  "max_debate_rounds": 1,
+  "max_risk_discuss_rounds": 1,
+  "max_tool_rounds": 10,
+  "llm_max_retries": 3,
+  "output_language": "English",
+  "pdf": true,
+  "require_key_limit": true,
+  "usage_settle_seconds": 20
+}
