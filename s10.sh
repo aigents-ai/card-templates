@@ -201,6 +201,7 @@ if [ "$DO" = y ]; then
     printf '브라우저가 넘어간 주소를 붙여 넣고 엔터 (화면에 안 보여요): '
     stty -echo 2>/dev/null; read -r R; stty echo 2>/dev/null; echo
     R=$(printf '%s' "$R" | tr -d ' \r\n\t')
+    case "$R" in 127.0.0.1:*|localhost:*) R="http://$R";; esac  # 주소창에서 http:// 없이 복사돼도 받는다
     case "$R" in http://127.0.0.1:*|http://localhost:*) ;; *) R=; echo "127.0.0.1 로 시작하는 주소가 아니에요 — 다시"; continue;; esac
     BAD0=$($H sh -c "grep -c 'not the address' $L/run/login.out")
     BAD1=$BAD0
