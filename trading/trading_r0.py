@@ -25,6 +25,7 @@ R0 통과 기준(계획서 8장): 정해진 종목의 분석·결정 기록이 �
       시험(--tag test)은 같은 구조로 /opt/data/work/trading-lab/tests/ 아래에 따로 남는다
 날짜: 코인은 방금 끝난 UTC 하루, 미국 주식은 마감(16:30 뉴욕)이 지난 마지막 거래일. 휴장일이면 건너뛴다.
       R0 실행은 시작 뒤 빠진 날(성공 기록 없음)을 종목마다 최대 2개씩 먼저 채우고 '늦게 채움'으로 표시한다.
+요약: --summary-file 경로를 주면 이번 실행의 종목별 결과를 JSON 으로 남긴다(호스트 근무표 → 비서실장 보고).
 종료 코드: 0 전부 성공(휴장 건너뜀 포함) · 1 실패한 종목 있음 · 2 설정·점검 실패 · 3 이미 실행 중
           · 4 전부 끝났지만 예비(유료)로 돈 종목이 있음 — 구독 로그인·한도를 봐야 한다
 """
@@ -37,11 +38,12 @@ import subprocess
 import sys
 import time
 import traceback
+import warnings
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "trading_r0 v2.1"
+VERSION = "trading_r0 v2.2"
 KST = ZoneInfo("Asia/Seoul")
 NY = ZoneInfo("America/New_York")
 LAB = Path(os.environ.get("TRADING_LAB_HOME", "/opt/data/trading-lab"))
@@ -57,6 +59,10 @@ os.environ["TZ"] = "Asia/Seoul"
 time.tzset()
 BACKFILL_DAYS = 45  # 빠진 날을 찾아 채울 때 거슬러 보는 최대 기간
 EXIT_FALLBACK = 4   # 전부 끝났지만 예비(유료)로 돈 종목이 있다 — 구독 로그인·한도를 봐야 한다
+
+# yfinance 가 pandas 3 에서 내는 사용 중단 경고(Pandas4Warning 등)는 결과와 상관없는 잡음이라 숨긴다
+warnings.filterwarnings("ignore", module=r"yfinance")
+SUMMARY: dict = {"results": [], "notes": []}  # --summary-file 로 남기는 이번 실행 요약(근무표 보고용)
 
 log = logging.getLogger("trading_r0")
 log.addHandler(logging.NullHandler())  # 점검 화면에는 경고 잡음을 내지 않는다(실행 때는 기록 파일로 간다)
@@ -630,6 +636,27 @@ def check(cfg: dict) -> int:
     return 0 if ok else 2
 
 
+def summarize(rec: dict) -> dict:
+    keep = ("ticker", "trade_date", "status", "brain", "rating", "cost_usd", "duration_s", "llm_calls", "tool_calls",
+            "backfill", "error", "report", "pdf")
+    return {**{k: rec.get(k) for k in keep}, "needs_login": needs_login(rec)}
+
+
+def finish(rc: int, path: str | None) -> int:
+    """종료 코드를 돌려주며, 요청이 있으면 이번 실행 요약을 원자적으로 남긴다(실패해도 실행 결과는 그대로)."""
+    if path:
+        try:
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_name(p.name + ".tmp")
+            tmp.write_text(json.dumps({**SUMMARY, "rc": rc, "finished_at": now_kst(), "runner": VERSION},
+                                      ensure_ascii=False, indent=1) + "\n", encoding="utf-8")
+            os.replace(tmp, p)
+        except OSError as e:
+            print(f"⚠️ 요약 파일을 남기지 못했어요: {e}")
+    return rc
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="트레이딩 연구소 R0 실행기")
     ap.add_argument("--check", action="store_true", help="점검만(돈·구독 사용량 안 씀)")
@@ -643,7 +670,9 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="성공 기록이 있어도 다시")
     ap.add_argument("--no-fallback", action="store_true", help="구독이 막혀도 예비로 넘어가지 않음")
     ap.add_argument("--backfill", type=int, default=2, help="R0 실행에서 종목마다 채울 빠진 날 수(기본 2, 0 이면 안 채움)")
+    ap.add_argument("--summary-file", help="이번 실행 요약 JSON 을 남길 경로(근무표 보고용)")
     a = ap.parse_args()
+    SUMMARY.update(started_at=now_kst(), group=a.group or "all", tag=a.tag)
 
     (LAB / "home").mkdir(parents=True, exist_ok=True)
     if a.login or a.whoami or a.logout:
@@ -657,6 +686,7 @@ def main() -> int:
     set_env_paths(a.tag)
     if a.check:
         return check(cfg)
+    S = a.summary_file
 
     base = out_base(a.tag)
     for d in (LAB / "logs", base / "records", base / "reports", base / "memory"):
@@ -670,7 +700,8 @@ def main() -> int:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         print("❌ 이미 실행 중이에요 — 끝난 뒤 다시")
-        return 3
+        SUMMARY["notes"].append("이미 실행 중이라 이번 실행은 건너뜀 — 다음 실행이 빠진 날을 채워요")
+        return finish(3, S)
 
     if a.tickers:
         tickers = [t.strip() for t in a.tickers.split(",") if t.strip()]
@@ -682,7 +713,7 @@ def main() -> int:
             group_of(cfg, t)
     except ValueError as e:
         print(f"❌ {e}")
-        return 2
+        return finish(2, S)
     key = load_key()
     prices = {}
     if key and cfg.get("fallback"):
@@ -703,6 +734,7 @@ def main() -> int:
                 dates[gname] = d
                 if d is None:
                     print(f"⏭️ 묶음 {gname}: {why} — 건너뜀", flush=True)
+                    SUMMARY["notes"].append(f"묶음 {gname}: {why} — 건너뜀")
 
     failed = fell_back = 0
     for t in tickers:
@@ -726,11 +758,12 @@ def main() -> int:
                     pass
             rec = run_one(cfg, key, t, trade_date, a.tag, prices, use_fallback=not a.no_fallback, backfill=late)
             print(line(rec), flush=True)
+            SUMMARY["results"].append(summarize(rec))
             failed += rec["status"] != "ok"
             fell_back += rec["status"] == "ok" and rec.get("brain") == "예비"
     if fell_back and not failed:
         print(f"⚠️ {fell_back}건을 예비(유료)로 돌렸어요 — 구독 로그인·한도를 확인하세요", flush=True)
-    return 1 if failed else EXIT_FALLBACK if fell_back else 0
+    return finish(1 if failed else EXIT_FALLBACK if fell_back else 0, S)
 
 
 if __name__ == "__main__":

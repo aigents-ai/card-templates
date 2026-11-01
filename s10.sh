@@ -97,7 +97,7 @@ get() {
   echo "$2  $T/$1" | sha256sum -c --quiet || { echo "STOP: $1 지문 불일치 — 설치 안 함"; exit 1; }
 }
 get requirements-r0.txt b31d1c22af642801ea03cd7765e79224c2f3009333908d3582e03917431a7720
-get trading_r0.py 954dcd10733d0307667dd27e45fc8954f3b225cc16528f6ed16cd6ff6d381556
+get trading_r0.py 3884c156deed8c7926ae96714cfd597f71b30cab629bf25e760e7e6d97441b32
 get trading_r0.json 52d53932f9a00e316494428c6048a936488f1b9c992bc2e467db36341b4209bb
 get trading_r0_pdf.js 2c3c926a18e42b152ae49ec8a3414a5f66f26e058fa4ae957631b83e8b72e6d8
 echo "파일 4개 확인"
