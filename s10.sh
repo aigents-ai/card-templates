@@ -97,7 +97,7 @@ get() {
   echo "$2  $T/$1" | sha256sum -c --quiet || { echo "STOP: $1 지문 불일치 — 설치 안 함"; exit 1; }
 }
 get requirements-r0.txt b31d1c22af642801ea03cd7765e79224c2f3009333908d3582e03917431a7720
-get trading_r0.py 68b15f5baec391bea9c8668064b9837f14a4e9d77f188cbd7507ec25db9533b8
+get trading_r0.py bfe7d386ff82f4a39ab6c5b8699997d33c0f8aad14d0cda4396fc13ee389e350
 get trading_r0.json 52d53932f9a00e316494428c6048a936488f1b9c992bc2e467db36341b4209bb
 get trading_r0_pdf.js 2c3c926a18e42b152ae49ec8a3414a5f66f26e058fa4ae957631b83e8b72e6d8
 echo "파일 4개 확인"
@@ -117,6 +117,7 @@ docker cp "$T/requirements-r0.txt" "$C:$L/requirements-r0.txt" && docker exec "$
 LS=$(sha256sum "$T/requirements-r0.txt" | cut -c1-64)
 docker exec -i -u hermes "$C" sh -s "$L" "$LS" <<'EOS'
 L=$1; LS=$2
+export PYTHON_DOTENV_DISABLED=1  # 설치 확인으로 tradingagents 를 가져올 때 /opt/data/.env(서버 비밀값)를 읽지 않게
 cd "$L" || exit 1
 ready() { [ -x venv/bin/python ] && [ "$(cat .installed 2>/dev/null)" = "$LS" ] && venv/bin/python -c 'import sys, tradingagents; sys.exit(tradingagents.__version__ != "0.7.1")' 2>/dev/null; }
 if ready; then echo "이미 설치됨 — 건너뜀"; exit 0; fi

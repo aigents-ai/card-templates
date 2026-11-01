@@ -48,7 +48,7 @@ get() {
   curl -sfL "$B/$1" -o "$T/${1##*/}" || { echo "STOP: $1 받기 실패"; exit 1; }
   echo "$2  $T/${1##*/}" | sha256sum -c --quiet || { echo "STOP: $1 지문 불일치 — 설치 안 함"; exit 1; }
 }
-get trading/trading_r0.py 68b15f5baec391bea9c8668064b9837f14a4e9d77f188cbd7507ec25db9533b8
+get trading/trading_r0.py bfe7d386ff82f4a39ab6c5b8699997d33c0f8aad14d0cda4396fc13ee389e350
 get trading/trading_r0_inbox.py a682f205a541f25387eaa66bdc50feff43ce0a12e388fa1452770b540d77024f
 get host/r0-run.sh 66d4fb1acedadf615ba30abeeab0b4be017d14b67a3fce45100b57e8b51101c9
 echo "파일 3개 확인"
@@ -61,8 +61,11 @@ docker exec "$C" chmod 644 "$L/staging/trading_r0.py" "$L/staging/trading_r0_inb
 echo "== 2 FRED 키 (거시 지표 · 무료 · 선택)"
 HAVE=n
 $H grep -q '^FRED_API_KEY=.' "$L/.env" 2>/dev/null && HAVE=y
+# FRED 없이 넘어갈 때의 안내: 저장된 키가 있으면 그 키를 계속 쓴다
+if [ $HAVE = y ]; then NOFRED="저장된 FRED 키를 그대로 써요"; else NOFRED="거시 지표 없이 돌아요(나중에 sh s11.sh 로 넣을 수 있어요)"; fi
 ASK=y
 if [ $HAVE = y ]; then
+  drain
   printf '저장된 FRED 키가 있어요. 그대로 쓰려면 엔터, 새로 넣으려면 n: '
   read -r a
   [ "$a" = n ] || ASK=n
@@ -70,27 +73,27 @@ fi
 n=0
 while [ $ASK = y ]; do
   n=$((n + 1))
+  drain  # 앞에서 더 눌린 엔터가 '건너뛰기'로 읽히지 않게
   printf 'FRED 키를 붙여 넣고 엔터 (화면에 안 보여요 · 건너뛰려면 그냥 엔터): '
   stty -echo 2>/dev/null; read -r K; stty echo 2>/dev/null; echo
   K=$(printf '%s' "$K" | tr -d ' \r\n\t')
-  if [ -z "$K" ]; then
-    if [ $HAVE = y ]; then echo "건너뜀 — 저장된 키를 그대로 써요"; else echo "건너뜀 — 거시 지표 없이 돌아요(나중에 sh s11.sh 로 넣을 수 있어요)"; fi
-    break
-  fi
+  if [ -z "$K" ]; then echo "건너뜀 — $NOFRED"; break; fi
   # 키는 표준 입력으로만 넘긴다(명령줄·파일에 남지 않게). 확인 결과 줄에는 끝 4자만 나온다
   OUT=$(printf '%s\n' "$K" | docker exec -i -u hermes "$C" sh -c "cd $L && venv/bin/python $L/staging/trading_r0.py --fred-test" 2>&1); rc=$?
   printf '%s\n' "$OUT" | tail -1
   case $rc in
     0|4)
-      printf 'FRED_API_KEY=%s\n' "$K" | docker exec -i -u hermes "$C" sh -c "umask 077; { grep -v '^FRED_API_KEY=' $L/.env 2>/dev/null; cat; } > $L/.env.new && chmod 600 $L/.env.new && mv $L/.env.new $L/.env" \
-        || { K=; echo "STOP: 키 저장 실패"; exit 1; }
-      [ $rc -eq 4 ] && echo "(FRED 에 닿지 않아 확인은 못 했지만 모양이 맞아서 저장했어요 — 실행 때 다시 시도해요)"
-      echo "저장: trading-lab/.env 에 FRED 키 (600 · 예비 키 줄은 그대로)"
+      if printf 'FRED_API_KEY=%s\n' "$K" | docker exec -i -u hermes "$C" sh -c "umask 077; { grep -v '^FRED_API_KEY=' $L/.env 2>/dev/null; cat; } > $L/.env.new && chmod 600 $L/.env.new && mv $L/.env.new $L/.env || { rm -f $L/.env.new; exit 1; }"; then
+        [ $rc -eq 4 ] && echo "(FRED 에 닿지 않아 확인은 못 했지만 모양이 맞아서 저장했어요 — 실행 때 다시 시도해요)"
+        echo "저장: trading-lab/.env 에 FRED 키 (600 · 예비 키 줄은 그대로)"
+      else
+        echo "⚠️ FRED 키를 저장하지 못했어요 — $NOFRED. 이 화면을 보내 주세요"
+      fi
       break;;
     3|5) [ $n -lt 3 ] && echo "다시 붙여 넣어 주세요 — FRED 사이트 API Keys 화면에서 키만 복사";;
-    *) echo "키 확인이 돌지 않았어요(코드 $rc) — FRED 없이 계속해요"; break;;
+    *) echo "키 확인이 돌지 않았어요(코드 $rc) — $NOFRED"; break;;
   esac
-  [ $n -lt 3 ] || { echo "세 번 다 안 됐어요 — FRED 없이 계속해요(나중에 sh s11.sh 로 다시)"; break; }
+  [ $n -lt 3 ] || { echo "세 번 다 안 됐어요 — $NOFRED"; break; }
 done
 K=; unset K
 

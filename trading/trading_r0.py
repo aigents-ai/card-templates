@@ -55,16 +55,10 @@ OR_API = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
 FRED_API = os.environ.get("FRED_API_BASE", "https://api.stlouisfed.org/fred")
 # TradingAgents 는 로그인·캐시를 ~/.tradingagents·~/.cache 에 둔다 — 가져오기 전에 집을 연구소 폴더 안으로 정한다
 os.environ["HOME"] = str(LAB / "home")
-# TradingAgents 는 가져올 때 '지금 폴더에서 위로' .env 를 찾아 읽는다. 다른 폴더에서 돌리면 /opt/data/.env(서버 비밀값)까지
-# 올라갈 수 있어서, 늘 연구소 폴더에서 돌게 한다 — 그러면 연구소 .env 만 읽힌다.
-try:
-    START_CWD = os.getcwd()  # 상대 경로로 받은 --summary-file 은 부른 곳 기준으로 푼다
-except OSError:
-    START_CWD = str(LAB)
-try:
-    os.chdir(LAB)
-except OSError:
-    pass
+# TradingAgents 는 가져올 때 '지금 폴더에서 위로' .env 를 찾아 읽는다. 연구소 .env 가 없거나 다른 폴더에서 돌리면
+# /opt/data/.env(서버 비밀값)까지 올라가 읽을 수 있어서 그 자동 읽기를 끈다. 필요한 키는 이 실행기가 연구소 .env 에서
+# 직접 꺼내 넘긴다(예비 키는 예비로 돌 때만, FRED 키는 load_fred).
+os.environ["PYTHON_DOTENV_DISABLED"] = "1"
 # TradingAgents 는 '분석 날짜 < 오늘(이 프로세스의 시간대)'이면 과거 시점 규칙으로 돈다. 한국 시간으로 두면
 # 미국 장 마감 뒤·코인 하루 마감 뒤 어느 때 돌려도 분석 날짜가 늘 '어제 이전'이라 모든 기록이 같은 규칙을 따른다.
 os.environ["TZ"] = "Asia/Seoul"
@@ -75,6 +69,7 @@ EXIT_FALLBACK = 4   # 전부 끝났지만 예비(유료)로 돈 종목이 있다
 # yfinance 가 pandas 3 에서 내는 사용 중단 경고(Pandas4Warning 등)는 결과와 상관없는 잡음이라 숨긴다
 warnings.filterwarnings("ignore", module=r"yfinance")
 SUMMARY: dict = {"results": [], "notes": []}  # --summary-file 로 남기는 이번 실행 요약(근무표 보고용)
+RUN_INFO: dict = {"fred": "none"}  # 이번 실행 전체에 걸친 사실(기록마다 붙인다)
 
 log = logging.getLogger("trading_r0")
 log.addHandler(logging.NullHandler())  # 점검 화면에는 경고 잡음을 내지 않는다(실행 때는 기록 파일로 간다)
@@ -157,22 +152,23 @@ def fred_key_shape_ok(k: str) -> bool:
 
 def fred_status(k: str) -> tuple[int, str]:
     """FRED 에 이 키로 한 번 물어본다(10년 국채 금리 계열 정보). (0 받음 · 3 거절 · 4 확인 못 함, 설명).
-    키는 주소에 실려 가므로, 오류 글에서 키를 지우는 TradingAgents 의 요청 함수를 쓴다."""
+    FRED 는 틀린·등록 안 된 키를 400 + 'api_key' 가 든 안내로 답한다 — 그때만 '거절'. 다른 오류(중간 차단·혼잡·고장)는
+    키 탓인지 알 수 없어 '확인 못 함'. 키는 주소에 실려 가므로, 오류 글에서 키를 지우는 TradingAgents 의 요청 함수를 쓴다."""
     try:
         from tradingagents.dataflows.net import get_scrubbed
         r = get_scrubbed(f"{FRED_API}/series", params={"series_id": "DGS10", "api_key": k, "file_type": "json"},
-                         timeout=20, secret=k, passthrough=(400, 401, 403))
-    except Exception as e:  # noqa: BLE001 — 연결 문제: 키 탓인지 알 수 없다
+                         timeout=20, secret=k, passthrough=(400,))
+    except Exception as e:  # noqa: BLE001 — 연결·서버 문제: 키 탓인지 알 수 없다
         return 4, f"FRED 확인 안 됨({type(e).__name__})"
     try:
         body = r.json()
     except ValueError:
         body = {}
+    if not isinstance(body, dict):
+        body = {}
     if r.status_code == 200:
-        ok = isinstance(body, dict) and bool(body.get("seriess"))
-        return (0, "FRED 응답 확인(10년 국채 금리)") if ok else (4, "FRED 응답이 이상해요")
-    msg = str(body.get("error_message") or "") if isinstance(body, dict) else ""
-    if r.status_code in (401, 403) or "api_key" in msg:
+        return (0, "FRED 응답 확인(10년 국채 금리)") if body.get("seriess") else (4, "FRED 응답이 이상해요")
+    if "api_key" in str(body.get("error_message") or ""):
         return 3, "FRED 가 이 키를 받지 않아요"
     return 4, f"FRED 응답 {r.status_code}"
 
@@ -519,7 +515,9 @@ def run_one(cfg: dict, key: str | None, ticker: str, trade_date: str, kind: str,
     rec = {
         "v": 2, "kind": kind, "runner": VERSION, "trade_date": trade_date, "ticker": ticker, "group": gname,
         "backfill": backfill,  # 그날 돌지 못해 나중에 채운 기록 — R0 '무중단' 판단에서 따로 센다
-        "fred_key": bool(os.environ.get("FRED_API_KEY")),  # 거시 지표(FRED)를 쓸 수 있었던 기록인지 — 기록끼리 비교할 때 가른다
+        # 거시 지표(FRED)를 쓸 수 있었는지 — 기록끼리 비교할 때 가른다. 실행 시작 때 한 번 확인:
+        # ok 받음 · rejected 키 거절 · unreachable 확인 안 됨(그 뒤 호출은 됐을 수도) · none 키 없음
+        "fred": RUN_INFO["fred"],
         "status": "running", "started_at": now_kst(), "finished_at": None, "duration_s": None,
         "brain": None, "provider": None, "rating": None, "cost_usd": None,
         "llm_calls": None, "tool_calls": None, "tokens_in": None, "tokens_out": None,
@@ -763,7 +761,7 @@ def main() -> int:
     set_env_paths(a.tag)
     if a.check:
         return check(cfg)
-    S = str(Path(START_CWD, a.summary_file)) if a.summary_file else None
+    S = a.summary_file
 
     base = out_base(a.tag)
     for d in (LAB / "logs", base / "records", base / "reports", base / "memory"):
@@ -792,6 +790,13 @@ def main() -> int:
         print(f"❌ {e}")
         return finish(2, S)
     key = load_key()
+    fk = os.environ.get("FRED_API_KEY")  # load_fred() 가 연구소 .env 에서 넘겨 둔 키
+    if fk:
+        code, msg = fred_status(fk)
+        RUN_INFO["fred"] = {0: "ok", 3: "rejected"}.get(code, "unreachable")
+        log.info("fred check: %s", msg)
+        if code == 3:
+            SUMMARY["notes"].append("FRED 가 키를 받지 않아 거시 지표 없이 돌았어요 — 대표가 sh s11.sh 로 새 키를 넣어야 해요")
     prices = {}
     if key and cfg.get("fallback"):
         try:
