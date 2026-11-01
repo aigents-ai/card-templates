@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# /root/publish-site.sh v1 (2026-10-31) — 자료실 게시기 A안. 휴대폰 콘솔에서: bash /root/publish-site.sh 001
+# /root/publish-site.sh v1.1 (2026-11-01) — 자료실 게시기 A안. 휴대폰 콘솔에서: bash /root/publish-site.sh 001
 # 결재 원장(이벤트 파일)에서 '승인'이고, 묶음 폴더의 지문이 승인한 버전과 같을 때만 자료실에 올린다.
+# v1.1: '게시함' 기록(published·posted)은 결재 결정이 아니라서 승인 상태를 덮지 않는다(인스타를 먼저 올린 뒤에도 올라간다).
+#       철회·반려·수정 같은 결정이 뒤에 있으면 그대로 막는다. 모르는 값도 막는다.
 # GitHub 토큰은 컨테이너 밖 /root/publisher/.env 에만 있다(직원들은 닿지 않음).
 # 올리기 전에 바뀌는 파일을 보여 주고 y를 받는다. 올리다 끊기면 재시도하지 않고 실제 반영 여부부터 확인한다.
 set -u
@@ -44,22 +46,29 @@ for f in sorted(x for x in d.rglob("*") if x.is_file() and x.name not in ("verdi
     h.update(str(f.relative_to(d)).encode())
     h.update(f.read_bytes())
 ver = h.hexdigest()[:8]
-cur = {}
+POSTING = {"published", "posted"}  # 게시 기록 — 결재 결정이 아니다
+cur, posted = {}, set()
 for f in sorted((W / "ops" / "approvals" / "decisions" / "events").glob("*.json")):
     try:
         ev = json.loads(f.read_text(encoding="utf-8"))
-        cur[f"{ev['id']}@{ev['version']}"] = ev["decision"]
+        k = f"{ev['id']}@{ev['version']}"
+        dec = str(ev["decision"]).strip().lower()
     except Exception:
         continue
-print(json.dumps({"id": d.name, "dir": str(d), "version": ver, "decision": cur.get(f"{d.name}@{ver}"),
+    if dec in POSTING:
+        posted.add(k)
+    else:
+        cur[k] = dec  # 가장 최근 결재 결정이 현재 상태(승인 뒤 철회도 여기서 잡힌다)
+key = f"{d.name}@{ver}"
+print(json.dumps({"id": d.name, "dir": str(d), "version": ver, "decision": cur.get(key), "posted": key in posted,
                   "url": str(entry.get("url", "")).strip("/"), "entry": entry}, ensure_ascii=False))
 PY
 )
 field() { printf '%s' "$INFO" | python3 -c "import json,sys; d=json.load(sys.stdin); v=d.get('$1'); print('' if v is None else v)"; }
 [ -n "$INFO" ] || { echo "❌ 컨테이너에서 묶음을 읽지 못했어요"; exit 1; }
 ERR=$(field error); [ -z "$ERR" ] || { echo "❌ $ERR"; exit 1; }
-ID=$(field id); D=$(field dir); VER=$(field version); DEC=$(field decision); URLDIR=$(field url)
-echo "묶음 $ID @$VER · 원장 결정: ${DEC:-없음}"
+ID=$(field id); D=$(field dir); VER=$(field version); DEC=$(field decision); URLDIR=$(field url); POSTED=$(field posted)
+echo "묶음 $ID @$VER · 원장 결정: ${DEC:-없음}$([ "$POSTED" = True ] && echo ' · 인스타 게시 기록 있음')"
 [ "$DEC" = approved ] || { echo "■ 승인된 버전이 아니에요 — 올리지 않아요(승인 전이거나, 승인 뒤 파일이 바뀌어 지문이 달라졌어요)"; exit 1; }
 [[ "$URLDIR" =~ ^[a-z0-9-]+$ ]] || { echo "❌ 페이지 폴더 이름이 이상해요: '$URLDIR'"; exit 1; }
 
