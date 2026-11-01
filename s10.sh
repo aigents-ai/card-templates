@@ -35,6 +35,9 @@ sys.exit(1)
 PY
 }
 
+# 앞에서 더 눌린 엔터·붙여 넣기가 남아 있다가 봉인 질문에 대신 답하지 않게 비운다(화면 입력일 때만)
+drain() { [ -t 0 ] || return 0; stty -icanon min 0 time 0 2>/dev/null; dd bs=4096 count=64 >/dev/null 2>&1; stty icanon 2>/dev/null; }
+
 # 우리 파일 세 개가 지금 내용 그대로 봉인됐는지: seal.sh 와 같은 방법(watch 의 함수)으로 본다
 sealed_ok() {
   docker exec -i -u hermes "$C" python3 -B - "$S" >/dev/null 2>&1 <<'PY'
@@ -94,7 +97,7 @@ get() {
   echo "$2  $T/$1" | sha256sum -c --quiet || { echo "STOP: $1 지문 불일치 — 설치 안 함"; exit 1; }
 }
 get requirements-r0.txt b31d1c22af642801ea03cd7765e79224c2f3009333908d3582e03917431a7720
-get trading_r0.py 71cb9781d8087febbfa0e63543846df893248130b22b212fbc839e8121f5bf01
+get trading_r0.py 954dcd10733d0307667dd27e45fc8954f3b225cc16528f6ed16cd6ff6d381556
 get trading_r0.json 52d53932f9a00e316494428c6048a936488f1b9c992bc2e467db36341b4209bb
 get trading_r0_pdf.js 2c3c926a18e42b152ae49ec8a3414a5f66f26e058fa4ae957631b83e8b72e6d8
 echo "파일 4개 확인"
@@ -170,7 +173,9 @@ if [ -n "$WHO" ] && [ "$WHO" != "-" ]; then
   [ "$a" = n ] || DO=n
 fi
 if [ "$DO" = y ]; then
-  $H sh -c "[ -s $L/run/login.pid ] && kill \$(cat $L/run/login.pid) 2>/dev/null; rm -f $L/run/login.out $L/run/login-url.txt $L/run/login.pid"
+  # 앞서 연 로그인이 남아 있으면 닫는다 — 그 번호가 정말 로그인 실행일 때만(재시작 뒤 같은 번호의 다른 프로그램을 건드리지 않게)
+  # shellcheck disable=SC2016  # 작은따옴표 안의 $ 는 컨테이너 안 sh 가 푼다
+  $H sh -c 'p=$(cat "$1/login.pid" 2>/dev/null); if [ -n "$p" ] && tr "\000" " " < "/proc/$p/cmdline" 2>/dev/null | grep -q -- "--login"; then kill "$p" 2>/dev/null; fi; rm -f "$1/login.out" "$1/login-url.txt" "$1/login.pid" "$1/login.in"' sh "$L/run"
   sleep 1
   docker exec -d -u hermes "$C" sh -c "cd $L && venv/bin/python $RUNNER --login > $L/run/login.out 2>&1" || { echo "STOP: 로그인을 시작하지 못했어요"; exit 1; }
   URL=
@@ -187,25 +192,39 @@ if [ "$DO" = y ]; then
   echo
   echo "$URL"
   echo
-  echo "허용하면 브라우저가 http://127.0.0.1:1455/… 로 넘어가며 '열 수 없음'이 떠요(정상). 그 주소 전체를 복사하세요."
+  echo "허용하면 브라우저가 http://127.0.0.1:…/auth/callback?… 주소로 넘어가며 '열 수 없음'이 떠요(정상). 그 주소 전체를 복사하세요."
   n=0; DONE=
   while [ $n -lt 3 ] && [ -z "$DONE" ]; do
     n=$((n + 1))
+    # 로그인 창이 이미 끝났으면(30분 지남·실패) 붙여 넣기를 받지 않는다
+    $H grep -q -E '^LOGIN-(OK|ERR)' "$L/run/login.out" 2>/dev/null && break
     printf '브라우저가 넘어간 주소를 붙여 넣고 엔터 (화면에 안 보여요): '
     stty -echo 2>/dev/null; read -r R; stty echo 2>/dev/null; echo
     R=$(printf '%s' "$R" | tr -d ' \r\n\t')
-    case "$R" in http://127.0.0.1:*|http://localhost:*) ;; *) echo "127.0.0.1 로 시작하는 주소가 아니에요(${#R}자) — 다시"; continue;; esac
+    case "$R" in http://127.0.0.1:*|http://localhost:*) ;; *) R=; echo "127.0.0.1 로 시작하는 주소가 아니에요 — 다시"; continue;; esac
     BAD0=$($H sh -c "grep -c 'not the address' $L/run/login.out")
-    printf '%s\n' "$R" | docker exec -i -u hermes "$C" timeout 20 sh -c "cat > $L/run/login.in" || { echo "STOP: 로그인 창이 닫혀 있어요(30분이 지났거나 실패) — sh s10.sh 를 다시"; exit 1; }
+    BAD1=$BAD0
+    # 파이프(로그인 실행이 기다리는 입구)가 있을 때만 쓴다 — 없으면 주소가 보통 파일로 남지 않게 아무것도 안 쓴다
+    printf '%s\n' "$R" | docker exec -i -u hermes "$C" timeout 20 sh -c '[ -p "$1" ] || exit 9; cat > "$1"' sh "$L/run/login.in"; wr=$?
     R=
-    for _ in $(seq 1 60); do
+    if [ $wr -ne 0 ]; then
+      $H grep -q -E '^LOGIN-(OK|ERR)' "$L/run/login.out" 2>/dev/null && break
+      echo "STOP: 로그인 창이 닫혀 있어요(30분이 지났거나 실패) — sh s10.sh 를 다시"; exit 1
+    fi
+    for _ in $(seq 1 150); do
       sleep 1
       if $H grep -q '^LOGIN-OK' "$L/run/login.out"; then DONE=ok; break; fi
       if $H grep -q '^LOGIN-ERR' "$L/run/login.out"; then DONE=err; break; fi
       BAD1=$($H sh -c "grep -c 'not the address' $L/run/login.out")
       if [ "$BAD1" != "$BAD0" ]; then echo "이번 로그인에서 나온 주소가 아니에요 — 방금 연 주소로 다시 해 보세요"; break; fi
     done
+    if [ -z "$DONE" ] && [ "$BAD1" = "$BAD0" ]; then
+      echo "STOP: 로그인 확인이 늦어지고 있어요 — 2~3분 뒤 sh s10.sh 를 다시 (로그인됐으면 '그대로 쓰려면 엔터'가 나와요)"; exit 1
+    fi
   done
+  if [ -z "$DONE" ]; then
+    if $H grep -q '^LOGIN-OK' "$L/run/login.out"; then DONE=ok; elif $H grep -q '^LOGIN-ERR' "$L/run/login.out"; then DONE=err; fi
+  fi
   $H sh -c "rm -f $L/run/login-url.txt"
   case "$DONE" in
     ok) echo "로그인 완료: $($H sh -c "grep -m1 '^LOGIN-OK' $L/run/login.out" | cut -c10-)";;
@@ -217,7 +236,7 @@ fi
 echo "== 6 점검 (돈·구독 안 씀)"
 $H sh -c "cd $L && TRADING_CONFIG=$L/staging/trading_r0.json TRADING_PDF_JS=$L/staging/trading_r0_pdf.js venv/bin/python $RUNNER --check" > "$T/check.out" 2>&1; rc=$?
 grep -v -E '^(Cookie|Failed to get ticker)' "$T/check.out"
-[ $rc -eq 0 ] || { echo "STOP: 점검 실패 — ❌ 줄을 고친 뒤 sh s10.sh 를 다시 (설치·키·로그인은 건너뛰어요 · 봉인 폴더는 그대로예요)"; exit 1; }
+[ $rc -eq 0 ] || { echo "STOP: 점검 실패 — ❌ 줄을 고친 뒤 sh s10.sh 를 다시. 설치는 건너뛰고, 키·로그인은 '그대로 쓰려면 엔터'(문제가 그쪽이면 n). 봉인 폴더는 그대로예요"; exit 1; }
 
 echo "== 7 실행기·설정·PDF 변환기 → scripts + 봉인"
 for f in $FILES; do
@@ -228,6 +247,7 @@ if sealed_ok; then
   echo "이미 지금 내용으로 봉인돼 있어요"
 elif [ -f "$SEAL" ]; then
   echo "새 파일(또는 바뀐 파일) trading_r0 세 개와 아는 변경만 보이면 y"
+  drain
   bash "$SEAL"
   sealed_ok || { echo "STOP: 봉인되지 않아 시험은 시작하지 않았어요 — 목록이 이상하면 화면을 보내 주시고, 괜찮으면 sh s10.sh 다시"; exit 1; }
 else

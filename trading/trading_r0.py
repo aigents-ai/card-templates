@@ -24,14 +24,15 @@ R0 통과 기준(계획서 8장): 정해진 종목의 분석·결정 기록이 �
       TradingAgents 기억: /opt/data/work/trading-lab/memory/trading_memory.md
       시험(--tag test)은 같은 구조로 /opt/data/work/trading-lab/tests/ 아래에 따로 남는다
 날짜: 코인은 방금 끝난 UTC 하루, 미국 주식은 마감(16:30 뉴욕)이 지난 마지막 거래일. 휴장일이면 건너뛴다.
+      R0 실행은 시작 뒤 빠진 날(성공 기록 없음)을 종목마다 최대 2개씩 먼저 채우고 '늦게 채움'으로 표시한다.
 종료 코드: 0 전부 성공(휴장 건너뜀 포함) · 1 실패한 종목 있음 · 2 설정·점검 실패 · 3 이미 실행 중
+          · 4 전부 끝났지만 예비(유료)로 돈 종목이 있음 — 구독 로그인·한도를 봐야 한다
 """
 import argparse
 import fcntl
 import json
 import logging
 import os
-import re
 import subprocess
 import sys
 import time
@@ -40,7 +41,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "trading_r0 v2"
+VERSION = "trading_r0 v2.1"
 KST = ZoneInfo("Asia/Seoul")
 NY = ZoneInfo("America/New_York")
 LAB = Path(os.environ.get("TRADING_LAB_HOME", "/opt/data/trading-lab"))
@@ -50,10 +51,12 @@ PDF_JS = Path(os.environ.get("TRADING_PDF_JS", "/opt/data/scripts/trading_r0_pdf
 OR_API = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
 # TradingAgents 는 로그인·캐시를 ~/.tradingagents·~/.cache 에 둔다 — 가져오기 전에 집을 연구소 폴더 안으로 정한다
 os.environ["HOME"] = str(LAB / "home")
-# 구독 한도·로그인·연결 문제처럼 '두뇌 쪽' 실패일 때만 예비로 넘어간다(자료 문제로 예비 돈을 쓰지 않게)
-PROVIDER_ERR = re.compile(r"429|usage.?limit|rate.?limit|quota|insufficient|unauthori|forbidden|authenticat|permission|"
-                          r"\b40[13]\b|sign.?in|chatgpt|credential|connection|proxy|unreachable|timed? ?out|timeout|"
-                          r"overloaded|\b5\d\d\b", re.I)
+# TradingAgents 는 '분석 날짜 < 오늘(이 프로세스의 시간대)'이면 과거 시점 규칙으로 돈다. 한국 시간으로 두면
+# 미국 장 마감 뒤·코인 하루 마감 뒤 어느 때 돌려도 분석 날짜가 늘 '어제 이전'이라 모든 기록이 같은 규칙을 따른다.
+os.environ["TZ"] = "Asia/Seoul"
+time.tzset()
+BACKFILL_DAYS = 45  # 빠진 날을 찾아 채울 때 거슬러 보는 최대 기간
+EXIT_FALLBACK = 4   # 전부 끝났지만 예비(유료)로 돈 종목이 있다 — 구독 로그인·한도를 봐야 한다
 
 log = logging.getLogger("trading_r0")
 log.addHandler(logging.NullHandler())  # 점검 화면에는 경고 잡음을 내지 않는다(실행 때는 기록 파일로 간다)
@@ -183,9 +186,6 @@ def login() -> int:
     except chatgpt_auth.ChatGPTAuthError as e:
         print(f"LOGIN-ERR {e}", flush=True)
         return 1
-    except OSError as e:  # 1455 번 포트가 이미 쓰이는 중 — 앞서 연 로그인 창이 아직 기다리는 중
-        print(f"LOGIN-ERR 앞서 연 로그인이 아직 기다리는 중이에요(30분 뒤 저절로 닫혀요): {e}", flush=True)
-        return 1
     except Exception as e:  # noqa: BLE001
         print(f"LOGIN-ERR {type(e).__name__}: {str(e)[:300]}", flush=True)
         return 1
@@ -195,8 +195,16 @@ def login() -> int:
 
 
 def whoami() -> int:
+    """로그인된 계정(가린 이메일). 파일만 있고 로그인이 끊겼으면(30일 넘게 안 썼거나 해제됨) '-'."""
     from tradingagents.llm_clients import chatgpt_auth
     who = chatgpt_auth.signed_in_as()
+    if who:
+        try:
+            chatgpt_auth.access_token()  # 필요하면 갱신까지 해 본다 — 끊긴 로그인은 여기서 드러난다
+        except chatgpt_auth.ChatGPTUnreachable:
+            pass  # OpenAI 에 닿지 않을 뿐 로그인은 살아 있을 수 있다
+        except chatgpt_auth.ChatGPTAuthError:
+            who = None
     print(mask_email(who) if who else "-")
     return 0 if who else 1
 
@@ -290,8 +298,9 @@ def trade_date_for(calendar: str, ticker: str) -> tuple[str | None, str]:
     utc: 방금 끝난 UTC 하루 — 코인 하루 봉은 UTC 0시(한국 9시)에 마감된다.
     us : 뉴욕 16:30 이 지난 마지막 평일, 그날 하루 봉이 실제로 있는지 야후에서 확인(휴장일 거르기).
     TradingAgents 는 날짜 d 의 실행을 'd 마감 뒤'로 보고 d 다음 첫 마감에 들어간 것으로 채점한다.
-    이 날짜는 '오늘'보다 앞이라 과거 시점 규칙으로 돈다(그 뒤 자료·날짜 없는 뉴스를 빼고 본다) —
-    R1 백테스트와 같은 규칙이라 기록끼리 비교할 수 있게, 일부러 이렇게 둔다."""
+    이 프로세스는 한국 시간(TZ)으로 돌아서, 이 날짜는 늘 '오늘'보다 앞이고 과거 시점 규칙으로 돈다
+    (그 뒤 자료·날짜 없는 뉴스·지금의 예측시장 확률을 빼고 본다) — R1 백테스트와 같은 규칙이라
+    기록끼리 비교할 수 있게, 일부러 이렇게 둔다."""
     if calendar == "utc":
         return (datetime.now(timezone.utc) - timedelta(days=1)).date().isoformat(), "UTC 하루"
     ny = datetime.now(NY)
@@ -310,6 +319,41 @@ def trade_date_for(calendar: str, ticker: str) -> tuple[str | None, str]:
     except Exception as e:  # noqa: BLE001 — 확인을 못 하면 그 날짜로 돌린다(자료가 없으면 실행이 알려 준다)
         log.warning("trading-day check failed for %s: %s", ticker, e)
     return d.isoformat(), "미국 거래일"
+
+
+def missing_dates(calendar: str, ticker: str, upto: str, limit: int) -> list[str]:
+    """R0 기록이 시작된 뒤로 빠진 날(성공 기록 없음)을 오래된 것부터 최대 limit 개.
+    컨테이너 재시작·잠금 충돌·중간에 죽은 실행·야후의 잘못된 휴장 판단으로 생긴 구멍을 다음 실행이 메운다.
+    시작일은 그 종목의 가장 이른 R0 기록 — 기록이 없으면(첫날) 채울 것도 없다."""
+    if limit <= 0:
+        return []
+    base = out_base("r0") / "records"
+    seen = sorted(p.parent.name for p in base.glob(f"*/{ticker}.json"))
+    if not seen:
+        return []
+    end = datetime.strptime(upto, "%Y-%m-%d").date()
+    start = max(datetime.strptime(seen[0], "%Y-%m-%d").date(), end - timedelta(days=BACKFILL_DAYS))
+    if calendar == "utc":
+        days = [start + timedelta(days=i) for i in range((end - start).days)]
+    else:
+        try:
+            import yfinance as yf
+            logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+            h = yf.Ticker(ticker).history(start=start.isoformat(), end=end.isoformat())
+            days = sorted({ix.date() for ix in h.index})
+        except Exception as e:  # noqa: BLE001 — 거래일을 못 알면 이번엔 채우지 않는다
+            log.warning("backfill calendar failed for %s: %s", ticker, e)
+            return []
+    out = []
+    for d in days:
+        p = base / d.isoformat() / f"{ticker}.json"
+        try:
+            ok = json.loads(p.read_text(encoding="utf-8")).get("status") == "ok"
+        except (OSError, ValueError):
+            ok = False
+        if not ok and d < end:
+            out.append(d.isoformat())
+    return out[:limit]
 
 
 # ───────── 기록 ─────────
@@ -366,14 +410,46 @@ def attempt(cfg: dict, tier: dict, group: dict, ticker: str, trade_date: str, ki
         raise
 
 
+def is_provider_error(e: BaseException) -> bool:
+    """두뇌(구독·API) 쪽 실패인지 — 예외 종류와 상태 코드로 가린다(문자열 맞추기는 자료·권한 오류까지 잡아서 안 씀).
+    구독 한도(429)·로그인 끊김·인증·연결·서버 오류면 예비로 넘어가고, 그 밖(자료·파일·반복 한도)은 넘어가지 않는다."""
+    try:
+        import openai
+    except ImportError:
+        openai = None
+    try:
+        from tradingagents.llm_clients.chatgpt_auth import ChatGPTAuthError
+    except ImportError:
+        ChatGPTAuthError = ()  # type: ignore[assignment]
+    seen, x = set(), e
+    while x is not None and id(x) not in seen:
+        seen.add(id(x))
+        if ChatGPTAuthError and isinstance(x, ChatGPTAuthError):
+            return True
+        if openai is not None:
+            if isinstance(x, (openai.RateLimitError, openai.AuthenticationError, openai.PermissionDeniedError,
+                              openai.APIConnectionError, openai.InternalServerError)):
+                return True
+            if isinstance(x, openai.APIStatusError) and getattr(x, "status_code", None) in (401, 402, 403, 408, 409, 429, 500, 502, 503, 504):
+                return True
+        x = x.__cause__ or x.__context__
+    return False
+
+
+def needs_login(rec: dict) -> bool:
+    return any("ChatGPTAuthError" in (a.get("error") or "") or "login chatgpt" in (a.get("error") or "")
+               for a in rec.get("attempts") or [])
+
+
 def run_one(cfg: dict, key: str | None, ticker: str, trade_date: str, kind: str, prices: dict,
-            use_fallback: bool) -> dict:
+            use_fallback: bool, backfill: bool = False) -> dict:
     gname, group = group_of(cfg, ticker)
     tiers = [("구독", cfg["primary"])]
     if use_fallback and cfg.get("fallback") and key:
         tiers.append(("예비", cfg["fallback"]))
     rec = {
         "v": 2, "kind": kind, "runner": VERSION, "trade_date": trade_date, "ticker": ticker, "group": gname,
+        "backfill": backfill,  # 그날 돌지 못해 나중에 채운 기록 — R0 '무중단' 판단에서 따로 센다
         "status": "running", "started_at": now_kst(), "finished_at": None, "duration_s": None,
         "brain": None, "provider": None, "rating": None, "cost_usd": None,
         "llm_calls": None, "tool_calls": None, "tokens_in": None, "tokens_out": None,
@@ -399,7 +475,7 @@ def run_one(cfg: dict, key: str | None, ticker: str, trade_date: str, kind: str,
         except Exception as e:  # noqa: BLE001 — 실패는 기록으로 남기고, 두뇌 쪽 실패면 예비로 넘어간다
             err = f"{type(e).__name__}: {str(e)[:500]}"
             log.error("attempt %s failed %s %s\n%s", label, ticker, trade_date, traceback.format_exc())
-            a.update(status="failed", error=err, **getattr(e, "stats", {}))
+            a.update(status="failed", error=err, provider_error=is_provider_error(e), **getattr(e, "stats", {}))
             rec.update(status="failed", error=err, brain=label, provider=tier["provider"], models=a["models"])
             rec.update(getattr(e, "stats", {}))
         finally:
@@ -411,7 +487,7 @@ def run_one(cfg: dict, key: str | None, ticker: str, trade_date: str, kind: str,
         if rec["status"] == "ok":
             break
         more = i + 1 < len(tiers)
-        if more and not PROVIDER_ERR.search(rec["error"] or ""):
+        if more and not a.get("provider_error"):
             log.info("not a provider error — no fallback: %s", rec["error"])
             break
     rec["duration_s"] = int(time.monotonic() - t0)
@@ -423,12 +499,13 @@ def run_one(cfg: dict, key: str | None, ticker: str, trade_date: str, kind: str,
 def settle_cost(cfg: dict, key: str, usage0: float, llm_calls) -> float | None:
     """키 사용액은 늦게 반영될 수 있어 몇 번 더 본다. AI 를 불렀는데 안 움직이면 0 이 아니라 '모름'."""
     settle = int(cfg.get("usage_settle_seconds", 20))
-    usage1 = None
     for _ in range(3):
         time.sleep(settle)
         usage1 = key_usage(key)
         if usage1 is not None and (usage1 > usage0 or not llm_calls):
-            return round(usage1 - usage0, 4)
+            time.sleep(settle)  # 처음 움직인 뒤에도 나머지가 늦게 들어올 수 있어 한 번 더 본다
+            usage2 = key_usage(key)
+            return round(max(usage1, usage2 or 0) - usage0, 4)
     log.warning("key usage did not move after %s LLM calls; cost unknown", llm_calls)
     return None
 
@@ -441,10 +518,12 @@ def line(rec: dict) -> str:
         cost = f"예비 ${rec['cost_usd']:.2f}" if rec.get("cost_usd") is not None else "예비 · 비용 모름"
     calls = f"AI 호출 {rec.get('llm_calls')}회 · 자료 호출 {rec.get('tool_calls')}회"
     tried = " (구독 실패 → 예비)" if len(rec.get("attempts") or []) > 1 else ""
+    late = " [늦게 채움]" if rec.get("backfill") else ""
+    hint = "\n   ⚠️ 구독 로그인이 끊겼어요 — sh s10.sh 를 다시 돌려 로그인 단계에서 n" if needs_login(rec) else ""
     if rec["status"] == "ok":
         where = rec.get("pdf") or rec.get("report")
-        return f"✅ {rec['ticker']} {rec['trade_date']}: {rec['rating']} · {cost}{tried} · {m}분 {s}초 · {calls} → {where}"
-    return f"❌ {rec['ticker']} {rec['trade_date']}: 실패 · {cost}{tried} · {m}분 {s}초 · {calls} · {rec.get('error')}"
+        return f"✅ {rec['ticker']} {rec['trade_date']}{late}: {rec['rating']} · {cost}{tried} · {m}분 {s}초 · {calls} → {where}{hint}"
+    return f"❌ {rec['ticker']} {rec['trade_date']}{late}: 실패 · {cost}{tried} · {m}분 {s}초 · {calls} · {rec.get('error')}{hint}"
 
 
 # ───────── 점검 ─────────
@@ -563,6 +642,7 @@ def main() -> int:
     ap.add_argument("--tag", default="r0", choices=("r0", "test"), help="기록의 종류: r0(이어지는 기록) · test(시험, 따로 보관)")
     ap.add_argument("--force", action="store_true", help="성공 기록이 있어도 다시")
     ap.add_argument("--no-fallback", action="store_true", help="구독이 막혀도 예비로 넘어가지 않음")
+    ap.add_argument("--backfill", type=int, default=2, help="R0 실행에서 종목마다 채울 빠진 날 수(기본 2, 0 이면 안 채움)")
     a = ap.parse_args()
 
     (LAB / "home").mkdir(parents=True, exist_ok=True)
@@ -611,28 +691,46 @@ def main() -> int:
         except Exception as e:  # noqa: BLE001 — 가격은 기록용: 못 읽어도 실행
             log.warning("price lookup failed: %s", e)
 
-    failed = 0
+    # 분석 날짜는 묶음마다 한 번만 정한다(장 마감 무렵에 돌아도 종목끼리 날짜가 갈리지 않게)
+    dates: dict[str, str | None] = {}
     for t in tickers:
-        _, g = group_of(cfg, t)
-        if a.date:
-            trade_date = a.date
-        else:
-            trade_date, why = trade_date_for(g["calendar"], t)
-            if trade_date is None:
-                print(f"⏭️ {t}: {why} — 건너뜀", flush=True)
-                continue
-        p = record_path(trade_date, t, a.tag)
-        if p.exists() and not a.force:
-            try:
-                if json.loads(p.read_text(encoding="utf-8")).get("status") == "ok":
-                    print(f"⏭️ {t} {trade_date}: 이미 성공 기록이 있어 건너뜀 ({rel(p)})", flush=True)
-                    continue
-            except (OSError, ValueError):
-                pass
-        rec = run_one(cfg, key, t, trade_date, a.tag, prices, use_fallback=not a.no_fallback)
-        print(line(rec), flush=True)
-        failed += rec["status"] != "ok"
-    return 1 if failed else 0
+        gname, g = group_of(cfg, t)
+        if gname not in dates:
+            if a.date:
+                dates[gname] = a.date
+            else:
+                d, why = trade_date_for(g["calendar"], t)
+                dates[gname] = d
+                if d is None:
+                    print(f"⏭️ 묶음 {gname}: {why} — 건너뜀", flush=True)
+
+    failed = fell_back = 0
+    for t in tickers:
+        gname, g = group_of(cfg, t)
+        today = dates[gname]
+        todo = []
+        if a.tag == "r0" and not a.date and not a.tickers and a.backfill > 0:
+            # 빠진 날 먼저(오래된 것부터). 휴장 판단이 틀렸던 날도 여기서 다시 잡힌다.
+            upto = today or (datetime.now(timezone.utc).date() + timedelta(days=1)).isoformat()
+            todo += [(d, True) for d in missing_dates(g["calendar"], t, upto, a.backfill)]
+        if today:
+            todo.append((today, False))
+        for trade_date, late in todo:
+            p = record_path(trade_date, t, a.tag)
+            if p.exists() and not a.force:
+                try:
+                    if json.loads(p.read_text(encoding="utf-8")).get("status") == "ok":
+                        print(f"⏭️ {t} {trade_date}: 이미 성공 기록이 있어 건너뜀 ({rel(p)})", flush=True)
+                        continue
+                except (OSError, ValueError):
+                    pass
+            rec = run_one(cfg, key, t, trade_date, a.tag, prices, use_fallback=not a.no_fallback, backfill=late)
+            print(line(rec), flush=True)
+            failed += rec["status"] != "ok"
+            fell_back += rec["status"] == "ok" and rec.get("brain") == "예비"
+    if fell_back and not failed:
+        print(f"⚠️ {fell_back}건을 예비(유료)로 돌렸어요 — 구독 로그인·한도를 확인하세요", flush=True)
+    return 1 if failed else EXIT_FALLBACK if fell_back else 0
 
 
 if __name__ == "__main__":
