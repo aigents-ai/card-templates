@@ -1,9 +1,10 @@
 #!/bin/sh
-# s10.sh - 2026-11-01 트레이딩 연구소 R0 설치 + 시험 1회 (VPS 호스트, root)
+# s10.sh v2 - 2026-11-01 트레이딩 연구소 R0 설치 + 시험 1회 (VPS 호스트, root)
 #  1) 파일 4개 받기·지문 확인  2) 컨테이너 파이썬·폴더  3) 가상환경 + 해시 고정 설치(TradingAgents 0.7.1, 처음 2~5분)
-#  4) OpenRouter 새 키(가려짐) → trading-lab/.env (600)  5) 점검(돈 안 씀 · 봉인 폴더 밖 사본으로)
-#  6) 실행기·설정·PDF 변환기 → /opt/data/scripts + 봉인(새 파일 확인 후 y)  7) 시험 1회(BTC-USD) 백그라운드 시작
-# 다시 돌려도 된다: 설치된 것은 건너뛰고, 저장된 키는 그대로 쓸지 묻고, 성공 기록이 있는 날짜는 다시 돌리지 않는다.
+#  4) OpenRouter 예비 키(가려짐) → trading-lab/.env (600)  5) ChatGPT 구독 로그인(주소 열기 → 넘어간 주소 붙여 넣기)
+#  6) 점검(돈·구독 안 씀 · 봉인 폴더 밖 사본으로)  7) 실행기·설정·PDF 변환기 → /opt/data/scripts + 봉인(y)
+#  8) 시험 1회(NVDA) 백그라운드 시작
+# 다시 돌려도 된다: 설치된 것은 건너뛰고, 저장된 키·로그인은 그대로 쓸지 묻고, 성공 기록이 있는 날짜는 다시 돌리지 않는다.
 # 봉인 폴더는 점검이 통과한 뒤에만 바꾸고, 봉인을 거절하면 시험은 시작하지 않는다.
 # 진행 확인: sh s10.sh status
 C="${HERMES_CONTAINER:-hermes-agent-bjmy-hermes-agent-1}"
@@ -16,6 +17,7 @@ SEAL="${S10_SEAL:-/root/seal.sh}"
 ASK="${S10_ASKENV:-/opt/data/profiles/insta-ai/ask.env}"
 H="docker exec -u hermes $C"
 FILES="trading_r0.py trading_r0.json trading_r0_pdf.js"
+RUNNER="$L/staging/trading_r0.py"
 trap 'stty echo 2>/dev/null' EXIT
 trap 'stty echo 2>/dev/null; echo; echo "중단했어요 — 다시 하려면 sh s10.sh"; exit 130' INT TERM
 
@@ -55,7 +57,6 @@ if [ "${1:-}" = status ]; then
   if locked; then RUN=1; else RUN=0; fi
   docker exec -i -u hermes "$C" python3 - "$W" "$RUN" <<'PY'
 import glob, json, os, sys
-from datetime import datetime, timezone
 w, running = sys.argv[1], sys.argv[2] == "1"
 fs = glob.glob(os.path.join(w, "records", "*", "*.json")) + glob.glob(os.path.join(w, "tests", "records", "*", "*.json"))
 fs.sort(key=os.path.getmtime)
@@ -64,22 +65,25 @@ if not fs:
     raise SystemExit
 d = json.load(open(fs[-1], encoding="utf-8"))
 head = f"{'시험 ' if d.get('kind') == 'test' else ''}{d['ticker']} {d['trade_date']}"
+tried = " (구독 실패 → 예비)" if len(d.get("attempts") or []) > 1 else ""
+if d.get("brain") == "예비":
+    cost = "예비 · 비용 모름" if d.get("cost_usd") is None else f"예비 ${d['cost_usd']:.2f}"
+else:
+    cost = "구독"
 if d["status"] == "running":
-    age = int((datetime.now(timezone.utc) - datetime.fromisoformat(d["started_at"])).total_seconds() / 60)
-    print(f"⏳ {head}: 도는 중 ({age}분째)" if running else f"⚠️ {head}: '도는 중'으로 남았는데 실행기는 멈춰 있어요 — 중간에 끊긴 것 같아요")
+    print(f"⏳ {head}: 도는 중" if running else f"⚠️ {head}: '도는 중'으로 남았는데 실행기는 멈춰 있어요 — 중간에 끊긴 것 같아요")
 elif d["status"] == "ok":
     m, s = divmod(d.get("duration_s") or 0, 60)
-    cost = "비용 모름" if d.get("cost_usd") is None else f"${d['cost_usd']:.2f}"
-    print(f"✅ {head}: {d['rating']} · {cost} · {m}분 {s}초 · AI 호출 {d.get('llm_calls')}회 · 자료 호출 {d.get('tool_calls')}회")
+    print(f"✅ {head}: {d['rating']} · {cost}{tried} · {m}분 {s}초 · AI 호출 {d.get('llm_calls')}회 · 자료 호출 {d.get('tool_calls')}회")
     print(f"   보고서: {d.get('pdf') or d.get('report')}")
 else:
-    print(f"❌ {head}: 실패 — {d.get('error')}")
+    print(f"❌ {head}: 실패{tried} — {d.get('error')}")
 PY
   $H sh -c "grep -v -E '^(Cookie|Failed to get ticker)' $L/logs/test-run.out 2>/dev/null | tail -2"
   exit 0
 fi
 
-printf '트레이딩 연구소 R0를 설치하고 BTC 시험을 1회 돌려요(돈은 시험 1회분만 써요). 진행할까요? (y/N) '
+printf '트레이딩 연구소 R0를 설치하고 NVDA 시험을 1회 돌려요(구독 사용량을 조금 써요). 진행할까요? (y/N) '
 read -r a
 [ "$a" = y ] || { echo "취소 — 아무것도 바꾸지 않았어요"; exit 0; }
 
@@ -90,16 +94,20 @@ get() {
   echo "$2  $T/$1" | sha256sum -c --quiet || { echo "STOP: $1 지문 불일치 — 설치 안 함"; exit 1; }
 }
 get requirements-r0.txt b31d1c22af642801ea03cd7765e79224c2f3009333908d3582e03917431a7720
-get trading_r0.py 2ecfac8fd5a83bb5bef30ccb4db46f0c1396c7f68aad3bb0d46f88f5e6cb6810
-get trading_r0.json e7269eae930d013e1db45bbfcd152d16b091d9aaf5900b5e6094e2c2aa6b9877
+get trading_r0.py 71cb9781d8087febbfa0e63543846df893248130b22b212fbc839e8121f5bf01
+get trading_r0.json 52d53932f9a00e316494428c6048a936488f1b9c992bc2e467db36341b4209bb
 get trading_r0_pdf.js 2c3c926a18e42b152ae49ec8a3414a5f66f26e058fa4ae957631b83e8b72e6d8
 echo "파일 4개 확인"
 
 echo "== 2 컨테이너 확인"
 $H python3 -c 'import sys; v = sys.version_info; assert v >= (3, 11), v; print("파이썬", sys.version.split()[0])' || { echo "STOP: 컨테이너 파이썬이 3.11 보다 낮아요"; exit 1; }
 $H node --version >/dev/null 2>&1 && echo "노드 있음 (PDF 변환용)" || echo "노드 없음 — PDF 없이 HTML 보고서만 남겨요"
-$H sh -c "mkdir -p $L/logs $L/cache $L/results $L/staging $W && chmod 700 $L" || { echo "STOP: 폴더를 만들지 못했어요"; exit 1; }
+$H sh -c "mkdir -p $L/logs $L/cache $L/results $L/staging $L/home $L/run $W && chmod 700 $L" || { echo "STOP: 폴더를 만들지 못했어요"; exit 1; }
 if locked; then echo "STOP: 실행기가 지금 도는 중이에요 — 끝난 뒤 다시 (확인: sh s10.sh status)"; exit 1; fi
+for f in $FILES; do
+  docker cp "$T/$f" "$C:$L/staging/$f" || { echo "STOP: $f 복사 실패"; exit 1; }
+done
+docker exec "$C" chmod 644 "$L/staging/trading_r0.py" "$L/staging/trading_r0.json" "$L/staging/trading_r0_pdf.js"
 
 echo "== 3 가상환경 + 설치"
 docker cp "$T/requirements-r0.txt" "$C:$L/requirements-r0.txt" && docker exec "$C" chmod 644 "$L/requirements-r0.txt" || { echo "STOP: 목록 복사 실패"; exit 1; }
@@ -131,15 +139,15 @@ rc=$?
 if [ $rc -eq 3 ]; then echo "STOP: 다른 창에서 설치가 아직 도는 중이에요 — 몇 분 뒤 다시"; exit 1; fi
 [ $rc -eq 0 ] || { echo "STOP: 설치 실패 — 위 마지막 몇 줄을 보내 주세요"; exit 1; }
 
-echo "== 4 OpenRouter 키"
+echo "== 4 OpenRouter 예비 키 (구독이 막힌 날만 써요)"
 NEW=y
 if $H test -s "$L/.env"; then
-  printf '저장된 키가 있어요. 그대로 쓰려면 엔터, 새로 넣으려면 n: '
+  printf '저장된 예비 키가 있어요. 그대로 쓰려면 엔터, 새로 넣으려면 n: '
   read -r a
   [ "$a" = n ] || NEW=n
 fi
 if [ "$NEW" = y ]; then
-  printf 'OpenRouter 새 키를 붙여 넣고 엔터 (화면에 안 보여요): '
+  printf 'OpenRouter 예비 키를 붙여 넣고 엔터 (화면에 안 보여요): '
   stty -echo 2>/dev/null; read -r K; stty echo 2>/dev/null; echo
   K=$(printf '%s' "$K" | tr -d ' \r\n\t')
   case "$K" in sk-or-v1-?*) ;; *) echo "STOP: OpenRouter 키 모양이 아니에요(${#K}자) — 저장 안 함"; exit 1;; esac
@@ -153,16 +161,65 @@ if [ "$NEW" = y ]; then
   echo "저장: trading-lab/.env (600, 컨테이너 안 · 봉인·백업 대상 아님)"
 fi
 
-echo "== 5 점검 (돈 안 씀)"
-for f in $FILES; do
-  docker cp "$T/$f" "$C:$L/staging/$f" || { echo "STOP: $f 복사 실패"; exit 1; }
-done
-docker exec "$C" chmod 644 "$L/staging/trading_r0.py" "$L/staging/trading_r0.json" "$L/staging/trading_r0_pdf.js"
-$H sh -c "cd $L && TRADING_CONFIG=$L/staging/trading_r0.json TRADING_PDF_JS=$L/staging/trading_r0_pdf.js venv/bin/python $L/staging/trading_r0.py --check" > "$T/check.out" 2>&1; rc=$?
-grep -v -E '^(Cookie|Failed to get ticker)' "$T/check.out"
-[ $rc -eq 0 ] || { echo "STOP: 점검 실패 — ❌ 줄을 고친 뒤 sh s10.sh 를 다시 (설치는 건너뛰어요 · 봉인 폴더는 그대로예요)"; exit 1; }
+echo "== 5 ChatGPT 구독 로그인"
+DO=y
+WHO=$($H sh -c "cd $L && venv/bin/python $RUNNER --whoami" 2>/dev/null)
+if [ -n "$WHO" ] && [ "$WHO" != "-" ]; then
+  printf '구독 로그인이 있어요(%s). 그대로 쓰려면 엔터, 다시 로그인하려면 n: ' "$WHO"
+  read -r a
+  [ "$a" = n ] || DO=n
+fi
+if [ "$DO" = y ]; then
+  $H sh -c "[ -s $L/run/login.pid ] && kill \$(cat $L/run/login.pid) 2>/dev/null; rm -f $L/run/login.out $L/run/login-url.txt $L/run/login.pid"
+  sleep 1
+  docker exec -d -u hermes "$C" sh -c "cd $L && venv/bin/python $RUNNER --login > $L/run/login.out 2>&1" || { echo "STOP: 로그인을 시작하지 못했어요"; exit 1; }
+  URL=
+  for _ in $(seq 1 40); do
+    sleep 1
+    URL=$($H sh -c "grep -m1 '^https://auth.openai.com/' $L/run/login.out 2>/dev/null")
+    [ -n "$URL" ] && break
+    $H grep -q '^LOGIN-ERR' "$L/run/login.out" 2>/dev/null && break
+  done
+  if [ -z "$URL" ]; then echo "STOP: 로그인 주소를 받지 못했어요 —"; $H sh -c "tail -3 $L/run/login.out"; exit 1; fi
+  printf '%s\n' "$URL" | docker exec -i -u hermes "$C" sh -c "cat > $L/run/login-url.txt"
+  echo "아래 주소를 브라우저에서 열고, ChatGPT Plus 계정으로 로그인한 뒤 '허용'을 누르세요."
+  echo "휴대폰이라 복사가 어려우면 비서실장에게 run/login-url.txt 주소를 보내 달라고 하세요(30분 안에)."
+  echo
+  echo "$URL"
+  echo
+  echo "허용하면 브라우저가 http://127.0.0.1:1455/… 로 넘어가며 '열 수 없음'이 떠요(정상). 그 주소 전체를 복사하세요."
+  n=0; DONE=
+  while [ $n -lt 3 ] && [ -z "$DONE" ]; do
+    n=$((n + 1))
+    printf '브라우저가 넘어간 주소를 붙여 넣고 엔터 (화면에 안 보여요): '
+    stty -echo 2>/dev/null; read -r R; stty echo 2>/dev/null; echo
+    R=$(printf '%s' "$R" | tr -d ' \r\n\t')
+    case "$R" in http://127.0.0.1:*|http://localhost:*) ;; *) echo "127.0.0.1 로 시작하는 주소가 아니에요(${#R}자) — 다시"; continue;; esac
+    BAD0=$($H sh -c "grep -c 'not the address' $L/run/login.out")
+    printf '%s\n' "$R" | docker exec -i -u hermes "$C" timeout 20 sh -c "cat > $L/run/login.in" || { echo "STOP: 로그인 창이 닫혀 있어요(30분이 지났거나 실패) — sh s10.sh 를 다시"; exit 1; }
+    R=
+    for _ in $(seq 1 60); do
+      sleep 1
+      if $H grep -q '^LOGIN-OK' "$L/run/login.out"; then DONE=ok; break; fi
+      if $H grep -q '^LOGIN-ERR' "$L/run/login.out"; then DONE=err; break; fi
+      BAD1=$($H sh -c "grep -c 'not the address' $L/run/login.out")
+      if [ "$BAD1" != "$BAD0" ]; then echo "이번 로그인에서 나온 주소가 아니에요 — 방금 연 주소로 다시 해 보세요"; break; fi
+    done
+  done
+  $H sh -c "rm -f $L/run/login-url.txt"
+  case "$DONE" in
+    ok) echo "로그인 완료: $($H sh -c "grep -m1 '^LOGIN-OK' $L/run/login.out" | cut -c10-)";;
+    err) echo "STOP: $($H sh -c "grep -m1 '^LOGIN-ERR' $L/run/login.out" | cut -c11-)"; exit 1;;
+    *) echo "STOP: 로그인이 끝나지 않았어요 — sh s10.sh 를 다시"; exit 1;;
+  esac
+fi
 
-echo "== 6 실행기·설정·PDF 변환기 → scripts + 봉인"
+echo "== 6 점검 (돈·구독 안 씀)"
+$H sh -c "cd $L && TRADING_CONFIG=$L/staging/trading_r0.json TRADING_PDF_JS=$L/staging/trading_r0_pdf.js venv/bin/python $RUNNER --check" > "$T/check.out" 2>&1; rc=$?
+grep -v -E '^(Cookie|Failed to get ticker)' "$T/check.out"
+[ $rc -eq 0 ] || { echo "STOP: 점검 실패 — ❌ 줄을 고친 뒤 sh s10.sh 를 다시 (설치·키·로그인은 건너뛰어요 · 봉인 폴더는 그대로예요)"; exit 1; }
+
+echo "== 7 실행기·설정·PDF 변환기 → scripts + 봉인"
 for f in $FILES; do
   docker cp "$T/$f" "$C:$S/$f" || { echo "STOP: $f 복사 실패"; exit 1; }
 done
@@ -170,20 +227,20 @@ docker exec "$C" chmod 644 "$S/trading_r0.py" "$S/trading_r0.json" "$S/trading_r
 if sealed_ok; then
   echo "이미 지금 내용으로 봉인돼 있어요"
 elif [ -f "$SEAL" ]; then
-  echo "새 파일 trading_r0 세 개(그리고 아는 변경만)가 보이면 y"
+  echo "새 파일(또는 바뀐 파일) trading_r0 세 개와 아는 변경만 보이면 y"
   bash "$SEAL"
   sealed_ok || { echo "STOP: 봉인되지 않아 시험은 시작하지 않았어요 — 목록이 이상하면 화면을 보내 주시고, 괜찮으면 sh s10.sh 다시"; exit 1; }
 else
   echo "STOP: 봉인 도구(/root/seal.sh)가 없어요 — s8 을 먼저 하세요"; exit 1
 fi
 
-echo "== 7 시험 1회 (BTC-USD)"
-docker exec -d -u hermes "$C" sh -c "cd $L && { echo; echo \"== \$(date '+%F %T') 시험 시작\"; timeout 3600 venv/bin/python $S/trading_r0.py --tickers BTC-USD --tag test; } >> $L/logs/test-run.out 2>&1" || { echo "STOP: 시험을 시작하지 못했어요"; exit 1; }
+echo "== 8 시험 1회 (NVDA)"
+docker exec -d -u hermes "$C" sh -c "cd $L && { echo; echo \"== \$(date '+%F %T') 시험 시작\"; timeout 3600 venv/bin/python $S/trading_r0.py --tickers NVDA --tag test; } >> $L/logs/test-run.out 2>&1" || { echo "STOP: 시험을 시작하지 못했어요"; exit 1; }
 sleep 20
 if locked; then
-  echo "시작했어요. 보통 5~20분 걸리고, 콘솔을 닫아도 계속 돌아요."
+  echo "시작했어요. 보통 10~25분 걸리고, 콘솔을 닫아도 계속 돌아요."
   echo "확인: sh s10.sh status"
-  echo "끝나면 #01-지시에서 비서실장에게 결과를 #40-연구소에 올려 달라고 하세요."
+  echo "끝나면 ChatGPT 설정 > 사용량에서 몇 % 썼는지 봐 두고, #01-지시에서 비서실장에게 결과를 #40-연구소에 올려 달라고 하세요."
 else
   echo "실행기가 바로 끝났어요 — 마지막 줄:"
   $H sh -c "grep -v -E '^(Cookie|Failed to get ticker)' $L/logs/test-run.out | tail -3"
