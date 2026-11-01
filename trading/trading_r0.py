@@ -15,9 +15,10 @@ R0 통과 기준(계획서 8장): 정해진 종목의 분석·결정 기록이 �
   ... --tickers NVDA --tag test                                      # 시험 1회
   ... --date 2026-10-30 · --force · --no-fallback
   ... --login | --whoami | --logout                                  # ChatGPT 구독 로그인 관리
+  ... --fred-test < 키                                               # FRED 키 확인(s11.sh 가 저장 전에 부른다)
 
 설정: /opt/data/scripts/trading_r0.json (봉인 대상 — 모델·종목·분석가를 바꾸면 감시가 알아챈다)
-키·로그인: /opt/data/trading-lab/.env (예비 OPENROUTER_API_KEY, 600)
+키·로그인: /opt/data/trading-lab/.env (예비 OPENROUTER_API_KEY · 거시 지표 FRED_API_KEY(선택), 600)
           /opt/data/trading-lab/home/.tradingagents/chatgpt-auth.json (구독 로그인, 600)
 결과: /opt/data/work/trading-lab/records/<날짜>/<종목>.json · records.jsonl
       /opt/data/work/trading-lab/reports/<날짜>/<종목>/complete_report.html (+ .pdf)
@@ -43,7 +44,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-VERSION = "trading_r0 v2.2"
+VERSION = "trading_r0 v2.3"
 KST = ZoneInfo("Asia/Seoul")
 NY = ZoneInfo("America/New_York")
 LAB = Path(os.environ.get("TRADING_LAB_HOME", "/opt/data/trading-lab"))
@@ -51,8 +52,19 @@ WORK = Path(os.environ.get("TRADING_WORK_DIR", "/opt/data/work/trading-lab"))
 CONFIG = Path(os.environ.get("TRADING_CONFIG", "/opt/data/scripts/trading_r0.json"))
 PDF_JS = Path(os.environ.get("TRADING_PDF_JS", "/opt/data/scripts/trading_r0_pdf.js"))
 OR_API = os.environ.get("OPENROUTER_API_BASE", "https://openrouter.ai/api/v1")
+FRED_API = os.environ.get("FRED_API_BASE", "https://api.stlouisfed.org/fred")
 # TradingAgents 는 로그인·캐시를 ~/.tradingagents·~/.cache 에 둔다 — 가져오기 전에 집을 연구소 폴더 안으로 정한다
 os.environ["HOME"] = str(LAB / "home")
+# TradingAgents 는 가져올 때 '지금 폴더에서 위로' .env 를 찾아 읽는다. 다른 폴더에서 돌리면 /opt/data/.env(서버 비밀값)까지
+# 올라갈 수 있어서, 늘 연구소 폴더에서 돌게 한다 — 그러면 연구소 .env 만 읽힌다.
+try:
+    START_CWD = os.getcwd()  # 상대 경로로 받은 --summary-file 은 부른 곳 기준으로 푼다
+except OSError:
+    START_CWD = str(LAB)
+try:
+    os.chdir(LAB)
+except OSError:
+    pass
 # TradingAgents 는 '분석 날짜 < 오늘(이 프로세스의 시간대)'이면 과거 시점 규칙으로 돈다. 한국 시간으로 두면
 # 미국 장 마감 뒤·코인 하루 마감 뒤 어느 때 돌려도 분석 날짜가 늘 '어제 이전'이라 모든 기록이 같은 규칙을 따른다.
 os.environ["TZ"] = "Asia/Seoul"
@@ -111,19 +123,70 @@ def group_of(cfg: dict, ticker: str) -> tuple[str, dict]:
     raise ValueError(f"설정의 어느 묶음에도 없는 종목: {ticker}")
 
 
-def load_key() -> str | None:
-    """예비(OpenRouter) 키. 없으면 None — 예비 없이 구독만으로 돈다."""
-    env = LAB / ".env"
+def env_value(name: str) -> str | None:
+    """연구소 .env 의 한 값. 없으면 None."""
     try:
-        lines = env.read_text(encoding="utf-8").splitlines()
+        lines = (LAB / ".env").read_text(encoding="utf-8").splitlines()
     except OSError:
         return None
     for line in lines:
         line = line.strip()
-        if line.startswith("OPENROUTER_API_KEY="):
-            key = line.split("=", 1)[1].strip().strip('"').strip("'")
-            return key or None
+        if line.startswith(name + "="):
+            v = line.split("=", 1)[1].strip().strip('"').strip("'")
+            return v or None
     return None
+
+
+def load_key() -> str | None:
+    """예비(OpenRouter) 키. 없으면 None — 예비 없이 구독만으로 돈다."""
+    return env_value("OPENROUTER_API_KEY")
+
+
+def load_fred() -> str | None:
+    """FRED 키(거시 지표, 선택)를 TradingAgents 가 읽는 환경 변수로 넘긴다. 없으면 거시 지표 없이 돈다."""
+    k = env_value("FRED_API_KEY")
+    if k:
+        os.environ["FRED_API_KEY"] = k
+    return k
+
+
+def fred_key_shape_ok(k: str) -> bool:
+    """FRED 키 모양: 소문자·숫자 32자(FRED 안내 그대로)."""
+    return len(k) == 32 and all(c in "abcdefghijklmnopqrstuvwxyz0123456789" for c in k)
+
+
+def fred_status(k: str) -> tuple[int, str]:
+    """FRED 에 이 키로 한 번 물어본다(10년 국채 금리 계열 정보). (0 받음 · 3 거절 · 4 확인 못 함, 설명).
+    키는 주소에 실려 가므로, 오류 글에서 키를 지우는 TradingAgents 의 요청 함수를 쓴다."""
+    try:
+        from tradingagents.dataflows.net import get_scrubbed
+        r = get_scrubbed(f"{FRED_API}/series", params={"series_id": "DGS10", "api_key": k, "file_type": "json"},
+                         timeout=20, secret=k, passthrough=(400, 401, 403))
+    except Exception as e:  # noqa: BLE001 — 연결 문제: 키 탓인지 알 수 없다
+        return 4, f"FRED 확인 안 됨({type(e).__name__})"
+    try:
+        body = r.json()
+    except ValueError:
+        body = {}
+    if r.status_code == 200:
+        ok = isinstance(body, dict) and bool(body.get("seriess"))
+        return (0, "FRED 응답 확인(10년 국채 금리)") if ok else (4, "FRED 응답이 이상해요")
+    msg = str(body.get("error_message") or "") if isinstance(body, dict) else ""
+    if r.status_code in (401, 403) or "api_key" in msg:
+        return 3, "FRED 가 이 키를 받지 않아요"
+    return 4, f"FRED 응답 {r.status_code}"
+
+
+def fred_test() -> int:
+    """s11.sh 가 저장 전에 부른다: 표준 입력의 키를 확인만 하고 아무 데도 남기지 않는다.
+    종료 코드 0 받음 · 3 거절 · 4 확인 못 함(연결) · 5 모양이 틀림."""
+    k = sys.stdin.readline().strip()
+    if not fred_key_shape_ok(k):
+        print(f"FRED 키 모양이 아니에요({len(k)}자 — 소문자·숫자 32자)")
+        return 5
+    code, msg = fred_status(k)
+    print(f"{msg} (끝 ...{k[-4:]})")
+    return code
 
 
 # ───────── OpenRouter(예비): 모델 확인 · 키 사용액 ─────────
@@ -456,6 +519,7 @@ def run_one(cfg: dict, key: str | None, ticker: str, trade_date: str, kind: str,
     rec = {
         "v": 2, "kind": kind, "runner": VERSION, "trade_date": trade_date, "ticker": ticker, "group": gname,
         "backfill": backfill,  # 그날 돌지 못해 나중에 채운 기록 — R0 '무중단' 판단에서 따로 센다
+        "fred_key": bool(os.environ.get("FRED_API_KEY")),  # 거시 지표(FRED)를 쓸 수 있었던 기록인지 — 기록끼리 비교할 때 가른다
         "status": "running", "started_at": now_kst(), "finished_at": None, "duration_s": None,
         "brain": None, "provider": None, "rating": None, "cost_usd": None,
         "llm_calls": None, "tool_calls": None, "tokens_in": None, "tokens_out": None,
@@ -609,6 +673,15 @@ def check(cfg: dict) -> int:
             except Exception as e:  # noqa: BLE001
                 print(f"❌ 예비 모델 목록 확인 실패: {e}")
                 ok = False
+    # FRED 는 덤(거시 지표) — 없거나 막혀도 점검은 통과, 실행은 거시 지표 없이 돈다
+    fk = load_fred()
+    if not fk:
+        print("FRED 키: 없음 — 거시 지표(금리·물가 등) 없이 돌아요 (넣으려면 sh s11.sh)")
+    else:
+        code, msg = fred_status(fk)
+        mark = "" if code == 0 else "⚠️ "
+        tail = {0: " — 거시 지표 사용", 3: " — 거시 지표가 빠져요. sh s11.sh 로 새 키를"}.get(code, " — 실행 때 다시 시도해요")
+        print(f"{mark}FRED 키: 있음 (끝 ...{fk[-4:]}) · {msg}{tail}")
     for name, g in cfg["groups"].items():
         t = g["tickers"][0]
         try:
@@ -663,6 +736,7 @@ def main() -> int:
     ap.add_argument("--login", action="store_true", help="ChatGPT 구독 로그인(s10.sh 가 부른다)")
     ap.add_argument("--whoami", action="store_true", help="로그인된 ChatGPT 계정")
     ap.add_argument("--logout", action="store_true", help="ChatGPT 구독 로그아웃(권한 거두기)")
+    ap.add_argument("--fred-test", action="store_true", help="표준 입력의 FRED 키를 확인만(저장 안 함 · s11.sh 가 부른다)")
     ap.add_argument("--group", help="묶음 이름(us · crypto), 기본은 전부")
     ap.add_argument("--tickers", help="쉼표로 구분 — 설정의 묶음에 있는 종목만")
     ap.add_argument("--date", help="YYYY-MM-DD — 기본은 묶음마다 정한 날짜(코인: 방금 끝난 UTC 하루, 미국: 마지막 거래일)")
@@ -675,6 +749,9 @@ def main() -> int:
     SUMMARY.update(started_at=now_kst(), group=a.group or "all", tag=a.tag)
 
     (LAB / "home").mkdir(parents=True, exist_ok=True)
+    if a.fred_test:
+        return fred_test()
+    load_fred()
     if a.login or a.whoami or a.logout:
         set_env_paths("r0")
         return login() if a.login else whoami() if a.whoami else logout()
@@ -686,7 +763,7 @@ def main() -> int:
     set_env_paths(a.tag)
     if a.check:
         return check(cfg)
-    S = a.summary_file
+    S = str(Path(START_CWD, a.summary_file)) if a.summary_file else None
 
     base = out_base(a.tag)
     for d in (LAB / "logs", base / "records", base / "reports", base / "memory"):

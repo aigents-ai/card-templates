@@ -1,7 +1,7 @@
 #!/bin/sh
 # s10.sh v2 - 2026-11-01 트레이딩 연구소 R0 설치 + 시험 1회 (VPS 호스트, root)
 #  1) 파일 4개 받기·지문 확인  2) 컨테이너 파이썬·폴더  3) 가상환경 + 해시 고정 설치(TradingAgents 0.7.1, 처음 2~5분)
-#  4) OpenRouter 예비 키(가려짐) → trading-lab/.env (600)  5) ChatGPT 구독 로그인(주소 열기 → 넘어간 주소 붙여 넣기)
+#  4) OpenRouter 예비 키(가려짐) → trading-lab/.env (600 · FRED 키 등 다른 줄은 그대로)  5) ChatGPT 구독 로그인(주소 열기 → 넘어간 주소 붙여 넣기)
 #  6) 점검(돈·구독 안 씀 · 봉인 폴더 밖 사본으로)  7) 실행기·설정·PDF 변환기 → /opt/data/scripts + 봉인(y)
 #  8) 시험 1회(NVDA) 백그라운드 시작
 # 다시 돌려도 된다: 설치된 것은 건너뛰고, 저장된 키·로그인은 그대로 쓸지 묻고, 성공 기록이 있는 날짜는 다시 돌리지 않는다.
@@ -97,7 +97,7 @@ get() {
   echo "$2  $T/$1" | sha256sum -c --quiet || { echo "STOP: $1 지문 불일치 — 설치 안 함"; exit 1; }
 }
 get requirements-r0.txt b31d1c22af642801ea03cd7765e79224c2f3009333908d3582e03917431a7720
-get trading_r0.py 3884c156deed8c7926ae96714cfd597f71b30cab629bf25e760e7e6d97441b32
+get trading_r0.py 68b15f5baec391bea9c8668064b9837f14a4e9d77f188cbd7507ec25db9533b8
 get trading_r0.json 52d53932f9a00e316494428c6048a936488f1b9c992bc2e467db36341b4209bb
 get trading_r0_pdf.js 2c3c926a18e42b152ae49ec8a3414a5f66f26e058fa4ae957631b83e8b72e6d8
 echo "파일 4개 확인"
@@ -144,7 +144,7 @@ if [ $rc -eq 3 ]; then echo "STOP: 다른 창에서 설치가 아직 도는 중�
 
 echo "== 4 OpenRouter 예비 키 (구독이 막힌 날만 써요)"
 NEW=y
-if $H test -s "$L/.env"; then
+if $H grep -q '^OPENROUTER_API_KEY=.' "$L/.env" 2>/dev/null; then
   printf '저장된 예비 키가 있어요. 그대로 쓰려면 엔터, 새로 넣으려면 n: '
   read -r a
   [ "$a" = n ] || NEW=n
@@ -159,7 +159,8 @@ if [ "$NEW" = y ]; then
     K=; unset K
     echo "STOP: 카드뉴스용(ask.env) 키와 같아요 — 트레이딩용으로 새 키를 따로 만들어 넣으세요(한도·비용을 따로 재려고)"; exit 1
   fi
-  printf 'OPENROUTER_API_KEY=%s\n' "$K" | docker exec -i -u hermes "$C" sh -c "umask 077; cat > $L/.env.new && chmod 600 $L/.env.new && mv $L/.env.new $L/.env" || { K=; echo "STOP: 키 저장 실패"; exit 1; }
+  # 예비 키 줄만 바꾸고 다른 줄(FRED 키 등)은 그대로 둔다
+  printf 'OPENROUTER_API_KEY=%s\n' "$K" | docker exec -i -u hermes "$C" sh -c "umask 077; { grep -v '^OPENROUTER_API_KEY=' $L/.env 2>/dev/null; cat; } > $L/.env.new && chmod 600 $L/.env.new && mv $L/.env.new $L/.env" || { K=; echo "STOP: 키 저장 실패"; exit 1; }
   K=; unset K
   echo "저장: trading-lab/.env (600, 컨테이너 안 · 봉인·백업 대상 아님)"
 fi
@@ -261,7 +262,7 @@ sleep 20
 if locked; then
   echo "시작했어요. 보통 10~25분 걸리고, 콘솔을 닫아도 계속 돌아요."
   echo "확인: sh s10.sh status"
-  echo "끝나면 ChatGPT 설정 > 사용량에서 몇 % 썼는지 봐 두고, #01-지시에서 비서실장에게 결과를 #40-연구소에 올려 달라고 하세요."
+  echo "끝나면 ChatGPT 설정 > 사용량에서 몇 % 썼는지 봐 두고, #01-지시에서 비서실장에게 결과 요약을 부탁하세요(매일 기록은 근무표가 #40 에 올려요)."
 else
   echo "실행기가 바로 끝났어요 — 마지막 줄:"
   $H sh -c "grep -v -E '^(Cookie|Failed to get ticker)' $L/logs/test-run.out | tail -3"
